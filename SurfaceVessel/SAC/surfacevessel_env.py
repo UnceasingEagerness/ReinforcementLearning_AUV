@@ -159,8 +159,8 @@ class SurfaceVesselEnv(gym.Env):
 
         pos   = dyn[6:9].astype(np.float32)    # x, y, z — z always ~0
         vel   = dyn[3:6].astype(np.float32)    # vx, vy, vz
-        vel_x = dyn[4]
-        vel_y = dyn[5]
+        vel_x = dyn[3]
+        vel_y = dyn[4]
         rpy   = dyn[15:18].astype(np.float32)  # roll, pitch, yaw (deg)
         yaw_rate = dyn[14]
 
