@@ -269,6 +269,10 @@ if __name__ == "__main__":
                 best_return = ep_return
                 torch.save(actor.state_dict(), f"runs/{run_name}/actor_best.pth")
             
+            if ep_count % 100 == 0:
+                torch.save(actor.state_dict(), f"runs/{run_name}/actor_ep{ep_count}.pth")
+                print(f"Checkpoint saved at EP {ep_count}")
+            
             print(f"EP {ep_count} | step={global_step} | return={ep_return:.2f} | len={ep_len} | dist={dist:.2f} | best={best_return:.2f}")
             writer.add_scalar("charts/episodic_return", ep_return, global_step)
             writer.add_scalar("charts/episodic_length", ep_len, global_step)

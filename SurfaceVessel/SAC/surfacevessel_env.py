@@ -323,9 +323,9 @@ class SurfaceVesselEnv(gym.Env):
             return 100.0, True
 
         return reward, False
-        '''
         
-        '''
+        
+        
         reward = 0.0
 
         # progress reward
