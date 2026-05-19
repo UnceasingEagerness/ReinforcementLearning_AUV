@@ -226,6 +226,8 @@ if __name__ == "__main__":
     )
     start_time = time.time()
     ep_count = 0
+    best_return = -np.inf
+
     
 
     # TRY NOT TO MODIFY: start the game
@@ -262,7 +264,12 @@ if __name__ == "__main__":
             ep_return = infos['episode']['r'][0]
             ep_len = infos['episode']['l'][0]
             dist = infos.get('dist_to_goal', [0.0])[0]
-            print(f"EP {ep_count} | step={global_step} | return={ep_return:.2f} | len={ep_len} | dist_to_goal={dist:.2f}")
+            
+            if ep_return > best_return:
+                best_return = ep_return
+                torch.save(actor.state_dict(), f"runs/{run_name}/actor_best.pth")
+            
+            print(f"EP {ep_count} | step={global_step} | return={ep_return:.2f} | len={ep_len} | dist={dist:.2f} | best={best_return:.2f}")
             writer.add_scalar("charts/episodic_return", ep_return, global_step)
             writer.add_scalar("charts/episodic_length", ep_len, global_step)
             writer.add_scalar("charts/dist_to_goal_final", dist, global_step)

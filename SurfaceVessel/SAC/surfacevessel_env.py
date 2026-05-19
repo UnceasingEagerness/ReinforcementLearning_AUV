@@ -123,7 +123,15 @@ class SurfaceVesselEnv(gym.Env):
 
         obs                = self._get_obs(sensors)
         reward, terminated  = self._get_reward(sensors)
-        truncated          = self.step_count >= self.max_steps
+
+
+        # distance truncation
+        dyn = sensors["DynamicsSensor"]
+        pos = dyn[6:9]
+        dist = float(np.linalg.norm(self.goal_pos[:2] - pos[:2]))
+        max_allowed_dist = float(np.linalg.norm(self.goal_pos[:2])) * 2.5
+        
+        truncated = (self.step_count >= self.max_steps) or (dist > max_allowed_dist)
 
         return obs, reward, terminated, truncated, self._get_info(sensors)
 
@@ -249,10 +257,12 @@ class SurfaceVesselEnv(gym.Env):
         # 5. Action smoothness
         reward -= 0.005 * self.action_diff
 
+        '''
         # 6. Distance truncation — goal_dist * 2.5
         max_allowed_dist = float(np.linalg.norm(self.goal_pos[:2])) * 2.5
         if dist > max_allowed_dist:
             return -50.0, True
+        '''
 
         # 7. Goal reached
         if dist < self.goal_radius:
