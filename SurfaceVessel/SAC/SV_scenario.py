@@ -12,7 +12,7 @@ SCENARIO = {
     "package_name": "Ocean",
     "world": "SimpleUnderwater",  # change to a world with water surface
     "main_agent": "vessel0",
-    "show_viewport": False,
+    "show_viewport": True,
     "agents": [
         {
             "agent_name": "vessel0",

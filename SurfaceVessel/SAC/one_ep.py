@@ -13,6 +13,10 @@ import torch.optim as optim
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 
+import pandas as pd                        # ← ADDED for CSV logging
+import matplotlib.pyplot as plt            # ← ADDED for plots
+import matplotlib.gridspec as gridspec     # ← ADDED for plot layout
+
 from buffers import ReplayBuffer
 
 
@@ -20,6 +24,8 @@ from buffers import ReplayBuffer
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
+    checkpoint: str = ""               # ← ADDED: path to actor .pth to load, e.g. runs/.../actor_best.pth
+    """path to a saved actor checkpoint to load before running"""
     seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True  #This ensures the DL model gives same reproducible results when initialised with same random seed.
@@ -38,7 +44,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "SurfaceVessel-v0"
     """the environment id of the task"""
-    total_timesteps: int =  10000000
+    total_timesteps: int = 10000        # ← CHANGED: 1 episode max (matches max_steps in make_env)
     """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -50,7 +56,7 @@ class Args:
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 5000#5e3
+    learning_starts: int = 0            # ← CHANGED: no random phase, use actor from step 1
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
@@ -152,6 +158,127 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
+# ── ADDED: reward breakdown (mirrors _get_reward in reward.py) ────
+def _reward_breakdown(env_unwrapped, sensors, action_diff):
+    dyn   = sensors["DynamicsSensor"]
+    pos   = dyn[6:9]
+    vel   = dyn[3:6]
+    rpy   = dyn[15:18]
+    goal  = env_unwrapped.goal_pos
+
+    dist  = float(np.linalg.norm(goal[:2] - pos[:2]))
+    speed = float(np.linalg.norm(vel[:2]))
+
+    # 1. Linear distance penalty
+    r_dist = -1.0 * dist
+
+    # 2. Progress reward
+    prev_dist  = env_unwrapped._prev_dist
+    r_progress = 0.0
+    if prev_dist is not None:
+        progress = prev_dist - dist
+        safe_progress = np.clip(progress, -2.0, 2.0)
+        r_progress = 50.0 * safe_progress
+
+    # 3. Heading alignment
+    goal_dir   = np.arctan2(goal[1] - pos[1], goal[0] - pos[0])
+    yaw_err    = abs((goal_dir - np.deg2rad(rpy[2]) + np.pi) % (2 * np.pi) - np.pi)
+    fwd        = np.cos(yaw_err)
+    
+    speed_gate = np.clip(speed / 2.0, 0.0, 1.0)
+    align_gate = 1.0 if fwd > 0 else 0.0
+    r_align    = 10.0 * fwd * speed_gate * align_gate
+
+    # 4. Existential time penalty
+    r_time     = -1.0
+
+    # 5. Action smoothness
+    r_action   = -0.5 * action_diff
+
+    return {
+        "dist":          dist,
+        "speed":         speed,
+        "yaw_error_deg": float(np.rad2deg(yaw_err)),
+        "r_dist":        float(r_dist),
+        "r_progress":    float(r_progress),
+        "r_align":       float(r_align),
+        "r_time":        float(r_time),
+        "r_action":      float(r_action),
+        "spawn_x":       0.0,
+        "spawn_y":       0.0,
+        "goal_x":        float(env_unwrapped.goal_pos[0]),
+        "goal_y":        float(env_unwrapped.goal_pos[1]),
+    }
+
+
+def _save_csv(records, path):
+    df = pd.DataFrame(records)
+    cols = ["step", "spawn_x", "spawn_y", "goal_x", "goal_y",
+            "dist", "speed", "yaw_error_deg",
+            "left_action", "right_action",
+            "r_dist", "r_progress", "r_align", "r_time", "r_action",
+            "r_total", "cumulative", "goal_reached"]
+    df[cols].to_csv(path, index=False, float_format="%.5f")
+    print(f"[analyze] CSV saved → {path}")
+    return df
+
+
+def _plot_results(df, path):
+    steps  = df["step"].values
+    colors = {"r_progress":"#1D9E75","r_align":"#378ADD",
+               "r_dist":"#E24B4A","r_time":"#888780","r_action":"#BA7517"}
+    labels = {"r_progress":"Progress (tanh)","r_align":"Align×speed",
+               "r_dist":"Dist penalty","r_time":"Time penalty","r_action":"Action penalty"}
+    keys   = ["r_progress","r_align","r_dist","r_time","r_action"]
+
+    fig = plt.figure(figsize=(16, 12))
+    fig.suptitle("SAC Episode — Reward Analysis", fontsize=14, fontweight="bold")
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+    # 1. step + cumulative
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(steps, df["r_total"],    color="#2c2c2c", lw=1.2, alpha=0.6, label="Step reward")
+    ax1.plot(steps, df["cumulative"], color="#534AB7", lw=2,               label="Cumulative")
+    ax1.axhline(0, color="#ccc", lw=0.8, ls="--")
+    ax1.set_title("Step & cumulative reward"); ax1.set_xlabel("Step"); ax1.set_ylabel("Reward")
+    ax1.legend(fontsize=9); ax1.grid(True, alpha=0.25)
+
+    # 2. stacked area
+    ax2 = fig.add_subplot(gs[1, :])
+    pv = np.zeros(len(df)); nv = np.zeros(len(df))
+    for k in keys:
+        v = df[k].values; p = np.clip(v,0,None); n = np.clip(v,None,0)
+        ax2.fill_between(steps, pv, pv+p, color=colors[k], alpha=0.75, label=labels[k])
+        ax2.fill_between(steps, nv, nv+n, color=colors[k], alpha=0.75)
+        pv += p; nv += n
+    ax2.axhline(0, color="#999", lw=0.8, ls="--")
+    ax2.set_title("Component breakdown (stacked)"); ax2.set_xlabel("Step"); ax2.set_ylabel("Reward")
+    ax2.legend(fontsize=8, ncol=2); ax2.grid(True, alpha=0.25)
+
+    # 3. state variables
+    ax3 = fig.add_subplot(gs[2, 0]); ax3b = ax3.twinx()
+    ax3.plot(steps,  df["dist"],          color="#E24B4A", lw=1.5, label="Dist (m)")
+    ax3.plot(steps,  df["speed"],         color="#1D9E75", lw=1.5, label="Speed (m/s)")
+    ax3b.plot(steps, df["yaw_error_deg"], color="#BA7517", lw=1.2, ls="--", label="Yaw err (°)")
+    ax3.set_title("State variables"); ax3.set_xlabel("Step")
+    ax3.set_ylabel("Dist / Speed"); ax3b.set_ylabel("Yaw error (°)", color="#BA7517")
+    l1,lb1 = ax3.get_legend_handles_labels(); l2,lb2 = ax3b.get_legend_handles_labels()
+    ax3.legend(l1+l2, lb1+lb2, fontsize=8); ax3.grid(True, alpha=0.25)
+
+    # 4. individual components
+    ax4 = fig.add_subplot(gs[2, 1])
+    for k in keys:
+        ax4.plot(steps, df[k], color=colors[k], lw=1.3, label=labels[k], alpha=0.85)
+    ax4.axhline(0, color="#ccc", lw=0.8, ls="--")
+    ax4.set_title("Individual components"); ax4.set_xlabel("Step"); ax4.set_ylabel("Reward")
+    ax4.legend(fontsize=8); ax4.grid(True, alpha=0.25)
+
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"[analyze] Plot saved → {path}")
+    plt.show()
+# ── END ADDED ─────────────────────────────────────────────────────────────────
+
+
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
@@ -206,6 +333,13 @@ if __name__ == "__main__":
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
+    # ── ADDED: load checkpoint if provided ───────────────────────────────────
+    if args.checkpoint:
+        actor.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        actor.eval()
+        print(f"[analyze] Loaded checkpoint: {args.checkpoint}")
+    # ── END ADDED ─────────────────────────────────────────────────────────────
+
     # Automatic entropy tuning
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
@@ -228,10 +362,37 @@ if __name__ == "__main__":
     ep_count = 0
     best_return = -np.inf
 
+    # ── ADDED: per-step logging ───────────────────────────────────────────────
+    step_records  = []
+    cumulative_r  = 0.0
+    _prev_action  = np.zeros(envs.single_action_space.shape, dtype=np.float32)
+
+    # Live CSV — open file now, write header, flush every step
+    import csv
+    os.makedirs(f"runs/{run_name}", exist_ok=True)
+    _live_csv_path = f"runs/{run_name}/reward_log.csv"
+    _live_csv_cols = ["step", "spawn_x", "spawn_y", "goal_x", "goal_y",
+                      "dist", "speed", "yaw_error_deg",
+                      "left_action", "right_action",
+                      "r_dist", "r_progress", "r_align", "r_time", "r_action",
+                      "r_total", "cumulative", "goal_reached"]
+    _live_csv_file   = open(_live_csv_path, "w", newline="")
+    _live_csv_writer = csv.DictWriter(_live_csv_file, fieldnames=_live_csv_cols, extrasaction="ignore")
+    _live_csv_writer.writeheader()
+    _live_csv_file.flush()
+    print(f"[analyze] Live CSV → {_live_csv_path}")
+    # ── END ADDED ─────────────────────────────────────────────────────────────
+
     
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+
+    # ── ADDED: print start and goal ───────────────────────────────────────────
+    _inner_env = envs.envs[0].unwrapped
+    print(f"[episode] Spawn : {_inner_env._get_info(_inner_env._last_sensors)['Spawn_Location']}")
+    print(f"[episode] Goal  : {_inner_env.goal_pos.tolist()}")
+    # ── END ADDED ─────────────────────────────────────────────────────────────
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:     #If the learning is in its early phases then it samples random actions.
@@ -242,6 +403,24 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+
+        # ── ADDED: capture per-step reward breakdown ──────────────────────────
+        _action_diff = float(np.linalg.norm(actions[0] - _prev_action))
+        _prev_action = actions[0].copy()
+        _inner_env   = envs.envs[0].unwrapped          # raw SurfaceVesselEnv
+        _bd          = _reward_breakdown(_inner_env, _inner_env._last_sensors, _action_diff)
+        cumulative_r += float(rewards[0])
+        _bd["step"]         = global_step
+        _bd["left_action"]  = float(actions[0][0])
+        _bd["right_action"] = float(actions[0][1])
+        _bd["r_total"]      = float(rewards[0])        # true reward from env
+        _bd["cumulative"]   = cumulative_r
+        _bd["goal_reached"] = bool(terminations[0])
+        step_records.append(_bd)
+        # Live write + flush so CSV updates in real time
+        _live_csv_writer.writerow({c: _bd.get(c, "") for c in _live_csv_cols})
+        _live_csv_file.flush()
+        # ── END ADDED ─────────────────────────────────────────────────────────
 
         #ep_count = 0
 
@@ -375,4 +554,12 @@ if __name__ == "__main__":
 
     # Save the actor
     torch.save(actor.state_dict(), f"runs/{run_name}/actor.pth")
-    print(f"Model saved to runs/{run_name}/actor.pth")        
+    print(f"Model saved to runs/{run_name}/actor.pth")
+
+    # ── ADDED: close live CSV and generate plots ──────────────────────────────
+    _live_csv_file.close()
+    print(f"[analyze] CSV finalised → {_live_csv_path}")
+    plot_path = f"runs/{run_name}/reward_plots.png"
+    df = pd.DataFrame(step_records)
+    _plot_results(df, plot_path)
+    # ── END ADDED ─────────────────────────────────────────────────────────────

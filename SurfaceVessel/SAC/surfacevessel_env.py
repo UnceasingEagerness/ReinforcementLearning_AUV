@@ -5,6 +5,8 @@ import holoocean
 from SV_scenario import SCENARIO
 import copy
 from sac_agent import Agent
+from reward import SurfaceVesselReward
+from collections import deque
 
 
 class SurfaceVesselEnv(gym.Env):
@@ -15,10 +17,12 @@ class SurfaceVesselEnv(gym.Env):
     def __init__(self, max_steps=10000,show_viewport=False):
         super().__init__()
 
+        self.action_history = deque(maxlen=20)
+
         self.max_steps  = max_steps
         self.step_count = 0
         self.action_diff = 0.0
-
+        self.reward_calculator = SurfaceVesselReward()
         # goal is on the surface — z=0
         # randomise goal, ensure it's not too close to spawn
         '''
@@ -67,7 +71,7 @@ class SurfaceVesselEnv(gym.Env):
         scenario = copy.deepcopy(self._base_scenario)
         scenario["agents"][0]["location"] = spawn_loc
 
-        self.sim = holoocean.make(scenario_cfg=scenario,show_viewport=False)
+        self.sim = holoocean.make(scenario_cfg=scenario,show_viewport=True)
 
     
     def reset(self, seed=None, options=None):
@@ -82,6 +86,7 @@ class SurfaceVesselEnv(gym.Env):
         sy = float(self.np_random.uniform(-5.0, 5.0))
         '''
         # randomise goal, min 3m from spawn
+        self.action_history.clear()
         
         while True:
             gx = float(self.np_random.uniform(-10.0, 10.0))
@@ -112,26 +117,31 @@ class SurfaceVesselEnv(gym.Env):
         self._prev_action = action.copy()
 
         # scale [-1,1] → thruster forces in Newtons
-        left_thrust  = float(action[0]) * 5000.0   # ±100 N
-        right_thrust = float(action[1]) * 5000.0   # ±100 N
+        left_thrust  = float(action[0]) * 1000.0   # ±100 N
+        right_thrust = float(action[1]) * 1000.0   # ±100 N
         #thruster_diff = abs(left_thrust - right_thrust)
 
         # act() for control_scheme 0: [LeftThruster, RightThruster]
         self.sim.act("vessel0", [left_thrust, right_thrust])
-        sensors = self.sim.tick()
+        #sensors = self.sim.tick()
+        frame_skip = 20 
+        for _ in range(frame_skip):
+            sensors = self.sim.tick()
         self._last_sensors = sensors
 
         obs                = self._get_obs(sensors)
         reward, terminated  = self._get_reward(sensors)
 
-
+        
         # distance truncation
         dyn = sensors["DynamicsSensor"]
         pos = dyn[6:9]
         dist = float(np.linalg.norm(self.goal_pos[:2] - pos[:2]))
-        max_allowed_dist = float(np.linalg.norm(self.goal_pos[:2])) * 2.5
+        #max_allowed_dist = float(np.linalg.norm(self.goal_pos[:2])) * 2.5
+        max_allowed_dist = 25
         
         truncated = (self.step_count >= self.max_steps) or (dist > max_allowed_dist)
+        
 
         return obs, reward, terminated, truncated, self._get_info(sensors)
 
@@ -216,10 +226,67 @@ class SurfaceVesselEnv(gym.Env):
         vel  = dyn[3:6]
         rpy  = dyn[15:18]
 
+        reward, terminated = self.reward_calculator.get_rewardS3(
+            pos=pos, 
+            vel=vel, 
+            rpy=rpy, 
+            goal_pos=self.goal_pos, 
+            #action_diff=self.action_diff,
+            action=self._prev_action,
+            goal_radius = self.goal_radius
+        )
+        
+        return reward, terminated
+
+        '''
         dist  = float(np.linalg.norm(self.goal_pos[:2] - pos[:2]))
         speed = float(np.linalg.norm(vel[:2]))
 
         reward = 0.0
+        # 1. Linear distance penalty (Scaled so it doesn't overpower)
+        # Keeps a constant gradient across the entire map
+        reward -= 0.1 * dist
+
+        # 2. Progress reward (Clipped instead of Tanh)
+        if self._prev_dist is not None:
+            progress = self._prev_dist - dist
+            # Clip progress to prevent physics glitch spikes, but keep it linear inside the normal operating range
+            safe_progress = np.clip(progress, -2.0, 2.0) 
+            reward += 50.0 * safe_progress
+        self._prev_dist = dist
+
+        # 3. Heading alignment 
+        goal_dir_yaw = np.arctan2(
+            self.goal_pos[1] - pos[1],
+            self.goal_pos[0] - pos[0]
+        )
+        
+        # Assuming rpy[2] is in degrees based on your code
+        vessel_yaw_rad = np.deg2rad(rpy[2]) 
+        yaw_error = abs((goal_dir_yaw - vessel_yaw_rad + np.pi) % (2 * np.pi) - np.pi)
+        
+        # forward_alignment is 1.0 at perfect aim, -1.0 at opposite aim
+        forward_alignment = np.cos(yaw_error)
+
+        # Linear speed gate: Ramp up linearly from 0 to 1 as speed goes from 0 to 2 m/s
+        # This rewards alignment even at low speeds, but prevents spinning in place
+        speed_gate = np.clip(speed / 2.0, 0.0, 1.0)
+        
+        # Only reward alignment if facing generally forward (> 0)
+        align_gate = 1.0 if forward_alignment > 0 else 0.0
+        
+        reward += 10.0 * forward_alignment * speed_gate * align_gate
+
+        # 4. Existential time penalty
+        reward -= 1.0
+
+        # 5. Action smoothness
+        reward -= 0.5 * self.action_diff
+
+        return reward, False
+
+
+        
 
         # 1. Smooth distance penalty using sigmoid
         # Instead of raw dist penalty, maps distance to smooth [-1, 0] range
@@ -232,7 +299,7 @@ class SurfaceVesselEnv(gym.Env):
             progress = self._prev_dist - dist
             # Smooth progress using tanh — caps large progress values
             # prevents reward spikes that destabilise Q-values
-            reward += 5.0 * np.tanh(progress * 2.0)
+            reward += 100.0 * np.tanh(progress * 2.0)
         self._prev_dist = dist
 
         # 3. Heading alignment with logistic smoothing
@@ -247,15 +314,15 @@ class SurfaceVesselEnv(gym.Env):
 
         # Logistic gate — smoothly activates when alignment > 0 and speed > 0.5
         # Instead of hard if-statement, smooth transition
-        speed_gate = 1.0 / (1.0 + np.exp(-5.0 * (speed - 0.5)))
+        speed_gate = 1.0 / (1.0 + np.exp(-5.0 * (speed - 3)))
         align_gate = 1.0 / (1.0 + np.exp(-5.0 * forward_alignment))
-        reward += 1.0 * speed * forward_alignment * speed_gate * align_gate
+        reward += 10.0 * speed * forward_alignment * speed_gate * align_gate
 
         # 4. Existential time penalty
-        reward -= 0.05
+        reward -= 1
 
         # 5. Action smoothness
-        reward -= 0.005 * self.action_diff
+        reward -= 0.5 * self.action_diff
 
         '''
         # 6. Distance truncation — goal_dist * 2.5
@@ -266,9 +333,11 @@ class SurfaceVesselEnv(gym.Env):
 
         # 7. Goal reached
         if dist < self.goal_radius:
-            return 100.0, True
+            return 1000.0, True
 
         return reward, False
+
+        '''
 
     '''
     def _get_reward(self, sensors):
